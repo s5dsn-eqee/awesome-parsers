@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="280" height="280" viewBox="0 0 280 280" role="img" aria-label="A parse tree built from a row of tokens">
+  <!-- Token row -->
+  <g fill="#f6f8fa" stroke="#8b949e" stroke-width="3">
+    <rect x="22"  y="226" width="36" height="28" rx="6"/>
+    <rect x="70"  y="226" width="36" height="28" rx="6"/>
+    <rect x="122" y="226" width="36" height="28" rx="6"/>
+    <rect x="174" y="226" width="36" height="28" rx="6"/>
+    <rect x="222" y="226" width="36" height="28" rx="6"/>
+  </g>
+  <!-- Edges -->
+  <g fill="none" stroke="#8b949e" stroke-width="4" stroke-linecap="round">
+    <line x1="140" y1="52"  x2="64"  y2="124"/>
+    <line x1="140" y1="52"  x2="140" y2="124"/>
+    <line x1="140" y1="52"  x2="216" y2="124"/>
+    <line x1="64"  y1="124" x2="40"  y2="226"/>
+    <line x1="64"  y1="124" x2="88"  y2="226"/>
+    <line x1="140" y1="124" x2="140" y2="226"/>
+    <line x1="216" y1="124" x2="192" y2="226"/>
+    <line x1="216" y1="124" x2="240" y2="226"/>
+  </g>
+  <!-- Internal nodes -->
+  <g stroke="#ffffff" stroke-width="4">
+    <circle cx="140" cy="52"  r="24" fill="#d9480f"/>
+    <circle cx="64"  cy="124" r="18" fill="#f59f00"/>
+    <circle cx="140" cy="124" r="18" fill="#f59f00"/>
+    <circle cx="216" cy="124" r="18" fill="#f59f00"/>
+  </g>
+</svg>

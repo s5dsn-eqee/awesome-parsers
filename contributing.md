@@ -10,7 +10,7 @@ Before proposing a project, check that it:
 2. Has documentation beyond a README stub (an API reference, a guide, or a genuinely thorough README).
 3. Is used by at least one notable downstream project, or is clearly the best option in its niche.
 
-Projects that fail the first test can still be worth knowing about. They go in the Graveyard with a one-line note on what replaced them, not in the main sections.
+Projects that fail the first test can still be worth knowing about. They go in [graveyard.md](graveyard.md) with a one-line note on what replaced them, not in the readme.
 
 Scope: things that parse. Parser combinators, parser generators, lexer generators, and libraries whose job is to turn a specific format or language into a tree or events. Full compilers, linters, and serialization frameworks are only listed when their parser is usable on its own.
 
@@ -37,7 +37,7 @@ Scope: things that parse. Parser combinators, parser generators, lexer generator
 
 A workflow runs on the first of every month and opens an issue listing every GitHub-hosted entry whose repository is archived, gone, or has not been pushed to in two years. A maintainer then:
 
-- moves confirmed entries to the Graveyard with a note on the successor, or
+- moves confirmed entries to [graveyard.md](graveyard.md) with a note on the successor, or
 - fixes the link if the project simply moved (to Codeberg, GitLab, a new organization), or
 - leaves it alone if the quiet period is explained (for example, a project whose development happens on another branch).
 
