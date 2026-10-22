@@ -56,4 +56,4 @@ python3 scripts/check_activity.py --list
 python3 scripts/check_activity.py --report report.md
 ```
 
-The same checks run in CI on every pull request, together with a link checker.
+The same checks run in CI on every pull request, together with a link checker that verifies every GitHub repository in the list still exists. Links to other hosts are not checked automatically.

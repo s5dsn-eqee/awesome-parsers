@@ -1,9 +1,5 @@
 name: Activity check
 
-# Monthly: flag entries whose repository is archived, gone, or has had no push
-# in two years, and open (or refresh) an issue listing them. A maintainer then
-# moves confirmed entries to the Graveyard; nothing is edited automatically.
-
 on:
   schedule:
     - cron: '0 6 1 * *'

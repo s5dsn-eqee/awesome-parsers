@@ -1,31 +1,8 @@
 #!/usr/bin/env python3
-"""Report README entries whose upstream GitHub repository is stale or archived.
+"""Flag README entries whose GitHub repository is missing, archived, moved, or inactive.
 
-Every list item of the form ``- [name](https://github.com/owner/repo) ...`` in
-the README is checked. Items under the sections named in ``--skip-section``
-(Graveyard, Learning Resources, and so on by default) are ignored.
-
-Two data sources are supported:
-
-* ``api`` - the GitHub REST API. Set ``GITHUB_TOKEN`` (or ``GH_TOKEN``) for a
-  usable rate limit. Reports ``pushed_at`` (last push to any branch), the
-  archived flag, and the star count. This is what the monthly workflow uses.
-* ``web`` - no token needed. Reads the repository's commit Atom feed for the
-  latest default-branch commit date and the repository page for the archived
-  flag. Slower, and the date is "last commit on the default branch" rather
-  than "last push to any branch".
-
-``--mode auto`` (the default) picks ``api`` when a token is present and ``web``
-otherwise.
-
-Examples::
-
-    python3 scripts/check_activity.py
-    python3 scripts/check_activity.py --max-age-days 730 --report report.md --json report.json
-    GITHUB_TOKEN=... python3 scripts/check_activity.py --fail-on-stale
-
-Exit status is 0 unless ``--fail-on-stale`` is given and stale, archived, or
-missing entries were found.
+Modes: api (GitHub REST, needs GITHUB_TOKEN or GH_TOKEN), web (commit feed, no token),
+auto (api when a token is set). Exit 1 with --fail-on-stale if anything is flagged.
 """
 
 from __future__ import annotations
@@ -40,68 +17,33 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from functools import reduce
+from typing import Callable, Iterable, Mapping, NamedTuple
 
 USER_AGENT = "awesome-parsers-activity-check (+https://github.com/s5dsn-eqee/awesome-parsers)"
-
+API_HEADERS = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
 LIST_ITEM_RE = re.compile(r"^\s*[-*]\s+\[([^\]]+)\]\((https?://[^)\s]+)\)")
 GITHUB_REPO_RE = re.compile(
     r"^https?://(?:www\.)?github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?(?:[/#?].*)?$"
 )
 HEADING_RE = re.compile(r"^(#{2,6})\s+(.*?)\s*$")
-
-DEFAULT_SKIP_SECTIONS = (
-    "Contents",
-    "Learning Resources",
-    "Graveyard",
-    "Contributing",
-    "License",
-)
+DEFAULT_SKIP_SECTIONS = ("Contents", "Learning Resources", "Graveyard", "Contributing", "License")
+NETWORK_ERRORS = (urllib.error.URLError, TimeoutError, http.client.HTTPException, ConnectionError)
 
 
-# --------------------------------------------------------------------------- #
-# README parsing
-# --------------------------------------------------------------------------- #
+class Entry(NamedTuple):
+    name: str
+    url: str
+    section: str | None
+    line: int
+    repo: str | None
 
 
-def parse_readme(path: str, skip_sections: set[str]) -> list[dict]:
-    """Return one dict per list item that links to a GitHub repository."""
-    entries: list[dict] = []
-    top: str | None = None
-    section: str | None = None
-    with open(path, encoding="utf-8") as fh:
-        for lineno, line in enumerate(fh, 1):
-            heading = HEADING_RE.match(line)
-            if heading:
-                level = len(heading.group(1))
-                title = heading.group(2)
-                if level == 2:
-                    top = title
-                    section = title
-                else:
-                    section = f"{top} / {title}" if top else title
-                continue
-            if top in skip_sections:
-                continue
-            item = LIST_ITEM_RE.match(line)
-            if not item:
-                continue
-            name, url = item.group(1), item.group(2)
-            repo_match = GITHUB_REPO_RE.match(url)
-            entries.append(
-                {
-                    "name": name,
-                    "url": url,
-                    "section": section,
-                    "line": lineno,
-                    "repo": f"{repo_match.group(1)}/{repo_match.group(2)}" if repo_match else None,
-                }
-            )
-    return entries
-
-
-# --------------------------------------------------------------------------- #
-# HTTP helpers
-# --------------------------------------------------------------------------- #
+class Response(NamedTuple):
+    status: int
+    body: bytes
+    headers: Mapping[str, str]
+    url: str
 
 
 class RateLimited(Exception):
@@ -111,73 +53,90 @@ class RateLimited(Exception):
 
 
 class TransientError(Exception):
-    """A network hiccup worth retrying."""
+    pass
 
 
-def fetch(url: str, headers: dict | None = None, timeout: int = 30) -> tuple[int, bytes, dict, str]:
-    """GET ``url``; return (status, body, headers, final_url)."""
+def log(message: str) -> None:
+    print(message, file=sys.stderr)
+
+
+def repo_of(url: str) -> str | None:
+    match = GITHUB_REPO_RE.match(url)
+    return f"{match.group(1)}/{match.group(2)}" if match else None
+
+
+def parse_readme(path: str, skip: frozenset[str]) -> tuple[Entry, ...]:
+    def step(state: tuple, numbered: tuple[int, str]) -> tuple:
+        top, section, entries = state
+        lineno, line = numbered
+        heading = HEADING_RE.match(line)
+        if heading:
+            level, title = len(heading.group(1)), heading.group(2)
+            return (title, title, entries) if level == 2 else (top, f"{top} / {title}" if top else title, entries)
+        item = LIST_ITEM_RE.match(line)
+        if top in skip or not item:
+            return state
+        entry = Entry(item.group(1), item.group(2), section, lineno, repo_of(item.group(2)))
+        return top, section, entries + (entry,)
+
+    with open(path, encoding="utf-8") as fh:
+        return reduce(step, enumerate(fh, 1), (None, None, ()))[2]
+
+
+def lower_keys(headers: Iterable[tuple[str, str]]) -> Mapping[str, str]:
+    return {k.lower(): v for k, v in headers}
+
+
+def read_body(resp) -> bytes:
+    try:
+        return resp.read()
+    except http.client.IncompleteRead as err:
+        if not err.partial:
+            raise TransientError(str(err)) from err
+        return err.partial
+
+
+def fetch(url: str, headers: Mapping[str, str] | None = None, timeout: int = 30) -> Response:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, **(headers or {})})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            hdrs = {k.lower(): v for k, v in resp.headers.items()}
-            try:
-                body = resp.read()
-            except http.client.IncompleteRead as err:
-                # GitHub sometimes closes large chunked responses early. The
-                # fields we look for are near the top of the page, so a
-                # non-empty partial body is good enough; an empty one is retried.
-                if not err.partial:
-                    raise TransientError(str(err)) from err
-                body = err.partial
-            return resp.status, body, hdrs, resp.geturl()
+            return Response(resp.status, read_body(resp), lower_keys(resp.headers.items()), resp.geturl())
     except urllib.error.HTTPError as err:
-        hdrs = {k.lower(): v for k, v in err.headers.items()}
-        if err.code in (403, 429) and hdrs.get("x-ratelimit-remaining") == "0":
-            reset = hdrs.get("x-ratelimit-reset")
+        hdrs = lower_keys(err.headers.items())
+        reset = hdrs.get("x-ratelimit-reset")
+        if err.code == 429 or (err.code == 403 and hdrs.get("x-ratelimit-remaining") == "0"):
             raise RateLimited(int(reset) if reset else None) from err
-        if err.code == 429:
-            raise RateLimited(None) from err
-        return err.code, err.read(), hdrs, url
+        return Response(err.code, err.read(), hdrs, url)
 
 
-def fetch_with_retry(url: str, headers: dict | None = None, attempts: int = 3) -> tuple[int, bytes, dict, str]:
-    delay = 15
-    for attempt in range(1, attempts + 1):
-        try:
-            return fetch(url, headers)
-        except RateLimited as rl:
-            if rl.reset_epoch:
-                wait = max(1, rl.reset_epoch - int(time.time()) + 2)
-            else:
-                wait = delay
-            if attempt == attempts or wait > 900:
-                raise
-            print(f"  rate limited, sleeping {wait}s", file=sys.stderr)
-            time.sleep(wait)
-            delay *= 2
-        except (urllib.error.URLError, TimeoutError, TransientError, http.client.HTTPException, ConnectionError) as err:
-            if attempt == attempts:
-                raise
-            print(f"  network error ({err}), retrying", file=sys.stderr)
-            time.sleep(min(delay, 5))
-    raise RuntimeError("unreachable")
+def fetch_with_retry(url: str, headers: Mapping[str, str] | None = None, attempts: int = 3, delay: int = 15) -> Response:
+    try:
+        return fetch(url, headers)
+    except RateLimited as rl:
+        wait = max(1, rl.reset_epoch - int(time.time()) + 2) if rl.reset_epoch else delay
+        if attempts == 1 or wait > 900:
+            raise
+        log(f"  rate limited, sleeping {wait}s")
+        time.sleep(wait)
+        return fetch_with_retry(url, headers, attempts - 1, delay * 2)
+    except (*NETWORK_ERRORS, TransientError) as err:
+        if attempts == 1:
+            raise
+        log(f"  network error ({err}), retrying")
+        time.sleep(min(delay, 5))
+        return fetch_with_retry(url, headers, attempts - 1, delay)
 
 
-# --------------------------------------------------------------------------- #
-# Checkers
-# --------------------------------------------------------------------------- #
+def failure(source: str, status: int) -> dict:
+    return {"status": "missing", "source": source} if status == 404 else {"status": "error", "source": source, "http_status": status}
 
 
 def check_api(repo: str, token: str | None) -> dict:
-    headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    status, body, _, _ = fetch_with_retry(f"https://api.github.com/repos/{repo}", headers)
-    if status == 404:
-        return {"status": "missing", "source": "api"}
-    if status != 200:
-        return {"status": "error", "source": "api", "http_status": status}
-    data = json.loads(body)
+    auth = {"Authorization": f"Bearer {token}"} if token else {}
+    resp = fetch_with_retry(f"https://api.github.com/repos/{repo}", {**API_HEADERS, **auth})
+    if resp.status != 200:
+        return failure("api", resp.status)
+    data = json.loads(resp.body)
     return {
         "status": "ok",
         "source": "api",
@@ -190,132 +149,118 @@ def check_api(repo: str, token: str | None) -> dict:
 
 
 def check_web(repo: str) -> dict:
-    status, feed, _, final_url = fetch_with_retry(f"https://github.com/{repo}/commits.atom")
-    if status == 404:
-        return {"status": "missing", "source": "web"}
-    if status != 200:
-        return {"status": "error", "source": "web", "http_status": status}
-    updated = re.search(rb"<updated>([^<]+)</updated>", feed)
-    last_activity = updated.group(1).decode() if updated else None
-
-    resolved = re.match(r"^https?://github\.com/([^/]+/[^/]+)", final_url)
-    resolved_repo = resolved.group(1) if resolved else repo
-
-    status, page, _, _ = fetch_with_retry(f"https://github.com/{repo}")
-    archived_match = re.search(rb'"isArchived":(true|false)', page) if status == 200 else None
-    archived = archived_match.group(1) == b"true" if archived_match else None
-
+    feed = fetch_with_retry(f"https://github.com/{repo}/commits.atom")
+    if feed.status != 200:
+        return failure("web", feed.status)
+    page = fetch_with_retry(f"https://github.com/{repo}")
+    updated = re.search(rb"<updated>([^<]+)</updated>", feed.body)
+    resolved = re.match(r"^https?://github\.com/([^/]+/[^/]+)", feed.url)
+    archived = re.search(rb'"isArchived":(true|false)', page.body) if page.status == 200 else None
     return {
         "status": "ok",
         "source": "web",
-        "last_activity": last_activity,
-        "archived": archived,
+        "last_activity": updated.group(1).decode() if updated else None,
+        "archived": archived.group(1) == b"true" if archived else None,
         "stars": None,
-        "resolved_repo": resolved_repo,
+        "resolved_repo": resolved.group(1) if resolved else repo,
     }
 
 
-# --------------------------------------------------------------------------- #
-# Evaluation and reporting
-# --------------------------------------------------------------------------- #
-
-
 def parse_iso(ts: str | None) -> dt.datetime | None:
-    if not ts:
-        return None
-    return dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    return dt.datetime.fromisoformat(ts.replace("Z", "+00:00")) if ts else None
 
 
-def evaluate(entry: dict, result: dict, now: dt.datetime, max_age_days: int) -> dict:
-    row = {**entry, **result}
-    reasons: list[str] = []
+def evaluate(entry: Entry, result: dict, now: dt.datetime, max_age_days: int) -> dict:
     last = parse_iso(result.get("last_activity"))
-    row["age_days"] = (now - last).days if last else None
-
-    if result.get("status") == "missing":
-        reasons.append("repository not found (404)")
-    elif result.get("status") == "error":
-        reasons.append(f"could not check (HTTP {result.get('http_status')})")
-    else:
-        if result.get("archived"):
-            reasons.append("archived")
-        if result.get("disabled"):
-            reasons.append("disabled")
-        if row["age_days"] is not None and row["age_days"] > max_age_days:
-            reasons.append(f"no activity for {row['age_days']} days")
-        resolved = result.get("resolved_repo")
-        if resolved and entry["repo"] and resolved.lower() != entry["repo"].lower():
-            reasons.append(f"moved to {resolved}")
-
-    row["reasons"] = reasons
-    row["flagged"] = bool(reasons)
-    return row
+    age = (now - last).days if last else None
+    resolved = result.get("resolved_repo")
+    moved = bool(resolved and entry.repo and resolved.lower() != entry.repo.lower())
+    checks = (
+        (result.get("archived"), "archived"),
+        (result.get("disabled"), "disabled"),
+        (age is not None and age > max_age_days, f"no activity for {age} days"),
+        (moved, f"moved to {resolved}"),
+    )
+    reasons = (
+        ["repository not found (404)"] if result["status"] == "missing"
+        else [f"could not check (HTTP {result.get('http_status')})"] if result["status"] == "error"
+        else [text for hit, text in checks if hit]
+    )
+    return {**entry._asdict(), **result, "age_days": age, "reasons": reasons, "flagged": bool(reasons)}
 
 
-def md_table(rows: list[dict]) -> str:
-    lines = [
-        "| Entry | Section | Last activity | Age (days) | Why |",
-        "| --- | --- | --- | --- | --- |",
-    ]
-    for r in rows:
-        last = (r.get("last_activity") or "")[:10]
-        age = "" if r.get("age_days") is None else str(r["age_days"])
-        lines.append(
-            f"| [{r['name']}]({r['url']}) | {r['section']} | {last} | {age} | {'; '.join(r['reasons'])} |"
-        )
-    return "\n".join(lines)
+def md_row(r: dict) -> str:
+    last = (r.get("last_activity") or "")[:10]
+    age = "" if r.get("age_days") is None else str(r["age_days"])
+    return f"| [{r['name']}]({r['url']}) | {r['section']} | {last} | {age} | {'; '.join(r['reasons'])} |"
 
 
-def build_report(rows: list[dict], unchecked: list[dict], max_age_days: int, now: dt.datetime, source: str) -> str:
-    flagged = [r for r in rows if r["flagged"]]
-    healthy = [r for r in rows if not r["flagged"]]
-    out = [
+def md_table(rows: Iterable[dict]) -> str:
+    header = ("| Entry | Section | Last activity | Age (days) | Why |", "| --- | --- | --- | --- | --- |")
+    return "\n".join((*header, *map(md_row, rows)))
+
+
+def build_report(rows: list[dict], unchecked: Iterable[Entry], max_age_days: int, now: dt.datetime, source: str) -> str:
+    flagged = sorted((r for r in rows if r["flagged"]), key=lambda r: r.get("age_days") or 0, reverse=True)
+    healthy = sorted((r for r in rows if not r["flagged"]), key=lambda r: r["name"].lower())
+    unchecked = tuple(unchecked)
+    lines = (
         f"# Activity report ({now:%Y-%m-%d})",
         "",
         f"Checked {len(rows)} GitHub-hosted entries via `{source}`; threshold {max_age_days} days.",
         "",
         f"## Flagged ({len(flagged)})",
         "",
-    ]
-    if flagged:
-        out.append(md_table(sorted(flagged, key=lambda r: (r.get('age_days') or 0), reverse=True)))
-    else:
-        out.append("Nothing to report.")
-    out += ["", f"## Healthy ({len(healthy)})", ""]
-    out.append("<details><summary>Show</summary>\n")
-    out.append(md_table(sorted(healthy, key=lambda r: r["name"].lower())) if healthy else "None.")
-    out.append("\n</details>")
-    if unchecked:
-        out += ["", f"## Not on GitHub, check by hand ({len(unchecked)})", ""]
-        out += [f"- [{e['name']}]({e['url']}) ({e['section']})" for e in unchecked]
-    return "\n".join(out) + "\n"
+        md_table(flagged) if flagged else "Nothing to report.",
+        "",
+        f"## Healthy ({len(healthy)})",
+        "",
+        "<details><summary>Show</summary>\n",
+        md_table(healthy) if healthy else "None.",
+        "\n</details>",
+        *(("", f"## Not on GitHub, check by hand ({len(unchecked)})", "") if unchecked else ()),
+        *(f"- [{e.name}]({e.url}) ({e.section})" for e in unchecked),
+    )
+    return "\n".join(lines) + "\n"
 
 
-def list_entries(readme: str, skip: set[str]) -> int:
-    """Print parsed entries and fail if any repository appears more than once."""
+def list_entries(readme: str, skip: frozenset[str]) -> int:
     entries = parse_readme(readme, skip)
-    by_repo: dict[str, list[dict]] = {}
-    for entry in entries:
-        print(f"{entry['line']:4d}  {entry['section']:<45} {entry['name']:<28} {entry['repo'] or entry['url']}")
-        if entry["repo"]:
-            by_repo.setdefault(entry["repo"].lower(), []).append(entry)
-    duplicates = {repo: items for repo, items in by_repo.items() if len(items) > 1}
-    github_count = sum(1 for e in entries if e["repo"])
-    print(f"\n{len(entries)} entries, {github_count} on GitHub, {len(entries) - github_count} elsewhere", file=sys.stderr)
-    if duplicates:
-        for repo, items in duplicates.items():
-            lines = ", ".join(str(i["line"]) for i in items)
-            print(f"duplicate: {repo} listed on lines {lines}", file=sys.stderr)
-        return 1
-    return 0
+    github = [e for e in entries if e.repo]
+    by_repo = {key: [e.line for e in github if e.repo.lower() == key] for key in {e.repo.lower() for e in github}}
+    duplicates = {key: lines for key, lines in by_repo.items() if len(lines) > 1}
+    print(*(f"{e.line:4d}  {e.section:<45} {e.name:<28} {e.repo or e.url}" for e in entries), sep="\n")
+    log(f"\n{len(entries)} entries, {len(github)} on GitHub, {len(entries) - len(github)} elsewhere")
+    tuple(log(f"duplicate: {key} listed on lines {', '.join(map(str, lines))}") for key, lines in duplicates.items())
+    return 1 if duplicates else 0
 
 
-# --------------------------------------------------------------------------- #
-# Main
-# --------------------------------------------------------------------------- #
+def safe_check(check: Callable[[str], dict], repo: str, source: str) -> dict:
+    try:
+        return check(repo)
+    except RateLimited:
+        raise
+    except Exception as err:  # noqa: BLE001
+        return {"status": "error", "source": source, "http_status": None, "error": str(err)}
 
 
-def main(argv: list[str] | None = None) -> int:
+def check_all(repos: Mapping[str, str], check: Callable[[str], dict], source: str, delay: float, quiet: bool) -> dict:
+    def one(i: int, key: str, repo: str) -> dict:
+        quiet or log(f"[{i}/{len(repos)}] {repo}")
+        result = safe_check(check, repo, source)
+        delay and time.sleep(delay)
+        return result
+
+    return {key: one(i, key, repo) for i, (key, repo) in enumerate(repos.items(), 1)}
+
+
+def write_text(path: str | None, text: str, mode: str = "w") -> None:
+    if path:
+        with open(path, mode, encoding="utf-8") as fh:
+            fh.write(text)
+
+
+def parse_args(argv: list[str] | None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--readme", default="README.md")
     ap.add_argument("--max-age-days", type=int, default=730)
@@ -326,74 +271,46 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", dest="json_path", help="write full results as JSON")
     ap.add_argument("--report", dest="report_path", help="write Markdown report")
     ap.add_argument("--fail-on-stale", action="store_true")
-    ap.add_argument("--list", action="store_true",
-                    help="only parse the README: print entries, fail on repositories listed twice (no network)")
+    ap.add_argument("--list", action="store_true", help="only parse the README and fail on duplicates (no network)")
     ap.add_argument("--quiet", action="store_true")
-    args = ap.parse_args(argv)
+    return ap.parse_args(argv)
 
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    skip = frozenset(args.skip_section or DEFAULT_SKIP_SECTIONS)
     if args.list:
-        return list_entries(args.readme, set(args.skip_section) if args.skip_section else set(DEFAULT_SKIP_SECTIONS))
+        return list_entries(args.readme, skip)
 
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
-    mode = args.mode
-    if mode == "auto":
-        mode = "api" if token else "web"
+    mode = args.mode if args.mode != "auto" else ("api" if token else "web")
     delay = args.delay if args.delay is not None else (0.0 if mode == "api" else 0.5)
-    skip = set(args.skip_section) if args.skip_section else set(DEFAULT_SKIP_SECTIONS)
-
-    entries = parse_readme(args.readme, skip)
-    github_entries = [e for e in entries if e["repo"]]
-    unchecked = [e for e in entries if not e["repo"]]
+    check = (lambda repo: check_api(repo, token)) if mode == "api" else check_web
     now = dt.datetime.now(dt.timezone.utc)
 
-    if not args.quiet:
-        print(f"{len(github_entries)} GitHub entries to check ({mode} mode), {len(unchecked)} non-GitHub entries skipped",
-              file=sys.stderr)
+    entries = parse_readme(args.readme, skip)
+    github_entries = [e for e in entries if e.repo]
+    unchecked = [e for e in entries if not e.repo]
+    repos = {e.repo.lower(): e.repo for e in github_entries}
+    args.quiet or log(f"{len(github_entries)} GitHub entries to check ({mode} mode), {len(unchecked)} non-GitHub entries skipped")
 
-    rows: list[dict] = []
-    seen: dict[str, dict] = {}
-    for i, entry in enumerate(github_entries, 1):
-        repo = entry["repo"]
-        if repo.lower() in seen:
-            result = seen[repo.lower()]
-        else:
-            if not args.quiet:
-                print(f"[{i}/{len(github_entries)}] {repo}", file=sys.stderr)
-            try:
-                result = check_api(repo, token) if mode == "api" else check_web(repo)
-            except RateLimited:
-                print("Rate limit exhausted; aborting. Set GITHUB_TOKEN or try again later.", file=sys.stderr)
-                return 2
-            except Exception as err:  # noqa: BLE001 - we want to keep going
-                result = {"status": "error", "source": mode, "http_status": None, "error": str(err)}
-            seen[repo.lower()] = result
-            if delay:
-                time.sleep(delay)
-        rows.append(evaluate(entry, result, now, args.max_age_days))
+    try:
+        results = check_all(repos, check, mode, delay, args.quiet)
+    except RateLimited:
+        log("Rate limit exhausted; aborting. Set GITHUB_TOKEN or try again later.")
+        return 2
 
+    rows = [evaluate(e, results[e.repo.lower()], now, args.max_age_days) for e in github_entries]
     flagged = [r for r in rows if r["flagged"]]
     report = build_report(rows, unchecked, args.max_age_days, now, mode)
+    payload = {"generated": now.isoformat(), "mode": mode, "max_age_days": args.max_age_days,
+               "entries": rows, "unchecked": [e._asdict() for e in unchecked]}
 
-    if args.report_path:
-        with open(args.report_path, "w", encoding="utf-8") as fh:
-            fh.write(report)
-    if args.json_path:
-        with open(args.json_path, "w", encoding="utf-8") as fh:
-            json.dump({"generated": now.isoformat(), "mode": mode, "max_age_days": args.max_age_days,
-                       "entries": rows, "unchecked": unchecked}, fh, indent=2)
-    if not args.report_path and not args.quiet:
-        print(report)
-    else:
-        print(f"flagged: {len(flagged)} of {len(rows)}", file=sys.stderr)
-
-    github_output = os.environ.get("GITHUB_OUTPUT")
-    if github_output:
-        with open(github_output, "a", encoding="utf-8") as fh:
-            fh.write(f"stale_count={len(flagged)}\n")
-
-    if args.fail_on_stale and flagged:
-        return 1
-    return 0
+    write_text(args.report_path, report)
+    write_text(args.json_path, json.dumps(payload, indent=2))
+    write_text(os.environ.get("GITHUB_OUTPUT"), f"stale_count={len(flagged)}\n", mode="a")
+    print(report) if not args.report_path and not args.quiet else log(f"flagged: {len(flagged)} of {len(rows)}")
+    return 1 if args.fail_on_stale and flagged else 0
 
 
 if __name__ == "__main__":

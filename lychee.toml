@@ -1,17 +1,9 @@
-# Link checker configuration (https://github.com/lycheeverse/lychee).
-
 cache = true
 max_cache_age = "1d"
 max_retries = 3
 timeout = 30
 max_concurrency = 8
 user_agent = "Mozilla/5.0 (compatible; awesome-parsers link check)"
-
-# 403 and 429 are what bot-hostile sites (SourceForge, YouTube, some docs hosts)
-# answer with even when the page is fine in a browser.
 accept = ["200..=299", "403", "429"]
-
-exclude = [
-  # Anchors inside this repository's own README are checked by awesome-lint.
-  "^#",
-]
+exclude = ["^#", "^https?://"]
+include = ["^https://github\\.com/"]
