@@ -1,0 +1,9 @@
+# Output of scripts/check_activity.py
+report.md
+report.json
+
+# Tooling
+node_modules/
+__pycache__/
+.lycheecache
+.DS_Store

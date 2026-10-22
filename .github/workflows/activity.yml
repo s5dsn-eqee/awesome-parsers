@@ -1,0 +1,66 @@
+name: Activity check
+
+# Monthly: flag entries whose repository is archived, gone, or has had no push
+# in two years, and open (or refresh) an issue listing them. A maintainer then
+# moves confirmed entries to the Graveyard; nothing is edited automatically.
+
+on:
+  schedule:
+    - cron: '0 6 1 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Check every GitHub-hosted entry
+        id: check
+        run: >
+          python scripts/check_activity.py
+          --mode api
+          --max-age-days 730
+          --report report.md
+          --json report.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: activity-report
+          path: |
+            report.md
+            report.json
+
+      - name: Open or refresh the review issue
+        if: steps.check.outputs.stale_count != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          STALE_COUNT: ${{ steps.check.outputs.stale_count }}
+        run: |
+          set -euo pipefail
+          month="$(date -u +%Y-%m)"
+          title="Activity check ${month}: ${STALE_COUNT} entries to review"
+          gh label create graveyard-candidate \
+            --description "Entry flagged by the monthly activity check" \
+            --color B60205 --force
+          existing="$(gh issue list --label graveyard-candidate --state open \
+            --search "\"Activity check ${month}\" in:title" \
+            --json number --jq '.[0].number // empty')"
+          if [ -n "${existing}" ]; then
+            gh issue edit "${existing}" --title "${title}" --body-file report.md
+            echo "Updated issue #${existing}"
+          else
+            gh issue create --title "${title}" --body-file report.md --label graveyard-candidate
+          fi

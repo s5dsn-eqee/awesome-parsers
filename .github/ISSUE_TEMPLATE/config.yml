@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a stale or broken entry
+    url: https://github.com/s5dsn-eqee/awesome-parsers/issues/new?labels=graveyard-candidate&title=Stale%3A+
+    about: Tell us when a listed project is archived, moved, or has gone quiet.

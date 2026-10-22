@@ -1,0 +1,61 @@
+name: Suggest an entry
+description: Propose a parser, generator, or format parser for the list.
+title: "Add: "
+labels: [suggestion]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks. Pull requests are even better than issues, but either works.
+        Entries need activity in the last 24 months, real documentation, and either notable adoption or a clear niche.
+  - type: input
+    id: name
+    attributes:
+      label: Project name
+    validations:
+      required: true
+  - type: input
+    id: url
+    attributes:
+      label: Source repository URL
+      description: The canonical repository, not a package registry page.
+    validations:
+      required: true
+  - type: input
+    id: language
+    attributes:
+      label: Implementation language(s)
+      placeholder: Rust
+    validations:
+      required: true
+  - type: dropdown
+    id: section
+    attributes:
+      label: Section
+      options:
+        - Parser Combinators
+        - PEG Parsers and Generators
+        - LL and Earley Parsers
+        - LR / LALR / GLR Generators
+        - Incremental and Error-Tolerant Parsers
+        - Lexers and Tokenizers
+        - Format Parsers
+        - Language Parsers
+        - Learning Resources
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: description
+    attributes:
+      label: One-sentence description
+      description: Factual, what makes it different from the entries already listed.
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why it qualifies
+      description: Last release or commit date, documentation, and a notable project that uses it.
+    validations:
+      required: true
